@@ -1,0 +1,280 @@
+        return json.loads(raw.decode("utf-8")) if raw else {}
+
+    def send_json(self, data, status=200, extra_headers=None):
+        body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.security_headers()
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_error_json(self, msg, status=400):
+        self.send_json({"error": msg}, status)
+
+    def _cookie_jar(self):
+        raw = self.headers.get("Cookie", "")
+        jar = cookies.SimpleCookie()
+        try:
+            jar.load(raw)
+        except Exception:
+            pass
+        return jar
+
+    def access_granted(self):
+        if not PUBLIC_MODE:
+            return True
+        jar = self._cookie_jar()
+        morsel = jar.get("access")
+        if not morsel:
+            return False
+        with SESSIONS_LOCK:
+            return bool(ACCESS_SESSIONS.get(morsel.value))
+
+    def security_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.send_header("X-Robots-Tag", "noindex, nofollow")
+
+    def current_user(self, con):
+        jar = self._cookie_jar()
+        morsel = jar.get("session")
+        if not morsel:
+            return None
+        token = morsel.value
+        with SESSIONS_LOCK:
+            uid = SESSIONS.get(token)
+        if not uid:
+            return None
+        return con.execute("SELECT * FROM users WHERE id=? AND active=1", (uid,)).fetchone()
+
+    def require_user(self, con):
+        user = self.current_user(con)
+        if not user:
+            self.send_error_json("Zaloguj użytkownika", 401)
+            return None
+        return user
+
+    def serve_static(self, path):
+        rel = "index.html" if path == "/" else path.lstrip("/")
+        if rel.startswith("static/"):
+            rel = rel[len("static/"):]
+        file_path = (STATIC / rel).resolve()
+        if STATIC.resolve() not in file_path.parents and file_path != STATIC.resolve():
+            return self.send_error(403)
+        if not file_path.exists() or not file_path.is_file():
+            return self.send_error(404)
+        data = file_path.read_bytes()
+        mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.security_headers()
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        cleanup_expired_docs()
+        parsed = urlparse(self.path)
+        path = parsed.path
+        qs = parse_qs(parsed.query)
+        if path == "/" or path.startswith("/static/"):
+            return self.serve_static(path)
+        if path == "/api/health":
+            return self.send_json({"ok": True, "public_mode": PUBLIC_MODE})
+        with db() as con:
+            if path == "/api/bootstrap":
+                granted = self.access_granted()
+                user = self.current_user(con) if granted else None
+                users = [dict(r) for r in con.execute("SELECT id,name,username,role,active,created_at FROM users WHERE active=1 ORDER BY role,name").fetchall()] if granted else []
+                return self.send_json({"current_user": rowdict(user), "users": users, "roles": sorted(ROLES), "task_templates": {k:{"label":v[0],"minutes":v[1]} for k,v in TASK_TEMPLATES.items()}, "suggested_milestones": SUGGESTED_MILESTONES, "public_mode": PUBLIC_MODE, "access_granted": granted})
+
+            if path == "/api/orders":
+                user = self.require_user(con)
+                if not user: return
+                all_flag = qs.get("all", ["0"])[0] == "1"
+                base = "SELECT o.*, uf.name owner_name, ud.name dispatcher_name FROM orders o LEFT JOIN users uf ON uf.id=o.owner_forwarder_id LEFT JOIN users ud ON ud.id=o.dispatcher_id"
+                params = []
+                if user["role"] == ROLE_FORWARDER:
+                    base += " WHERE o.owner_forwarder_id=?"; params.append(user["id"])
+                elif user["role"] == ROLE_DISPATCHER and not all_flag:
+                    base += " WHERE o.dispatcher_id=?"; params.append(user["id"])
+                base += " ORDER BY o.updated_at DESC"
+                rows = [dict(r) for r in con.execute(base, params).fetchall()]
+                for o in rows:
+                    orow = con.execute("SELECT * FROM orders WHERE id=?", (o["id"],)).fetchone()
+                    o["missing_count"] = len(order_missing_fields(orow))
+                    trows = [serialize_task(t) for t in con.execute("SELECT * FROM tasks WHERE order_id=?", (o["id"],)).fetchall()]
+                    o["critical_tasks"] = sum(1 for t in trows if t["sla_state"] == "critical")
+                    o["open_tasks"] = sum(1 for t in trows if t["status"] != "resolved")
+                return self.send_json({"orders": rows})
+
+            m = re.fullmatch(r"/api/orders/(\d+)", path)
+            if m:
+                user = self.require_user(con)
+                if not user: return
+                oid = int(m.group(1))
+                if not can_access_order(con, user, oid, True):
+                    return self.send_error_json("Brak dostępu", 403)
+                bundle = get_order_bundle(con, oid)
+                if not bundle: return self.send_error_json("Nie znaleziono", 404)
+                bundle["metrics"] = metrics_for_tasks(bundle["tasks"])
+                return self.send_json(bundle)
+
+            m = re.fullmatch(r"/api/documents/(\d+)/download", path)
+            if m:
+                user = self.require_user(con)
+                if not user: return
+                doc = con.execute("SELECT * FROM documents WHERE id=?", (int(m.group(1)),)).fetchone()
+                if not doc or not can_access_order(con, user, doc["order_id"], True):
+                    return self.send_error_json("Brak dostępu", 403)
+                fp = UPLOADS / doc["stored_name"]
+                if not fp.exists(): return self.send_error_json("Plik nie istnieje", 404)
+                data = fp.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", doc["mime"] or "application/octet-stream")
+                safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", doc["filename"])
+                self.send_header("Content-Disposition", f'attachment; filename="{safe_name}"')
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.security_headers()
+                self.end_headers(); self.wfile.write(data); return
+
+            if path == "/api/performance":
+                user = self.require_user(con)
+                if not user: return
+                if user["role"] != ROLE_SUPERVISOR:
+                    return self.send_error_json("Tylko supervisor", 403)
+                users_out = []
+                for u in con.execute("SELECT * FROM users WHERE active=1 ORDER BY role,name").fetchall():
+                    trs = [serialize_task(r) for r in con.execute("SELECT * FROM tasks WHERE assigned_to=?", (u["id"],)).fetchall()]
+                    mm = metrics_for_tasks(trs)
+                    users_out.append({"id":u["id"],"name":u["name"],"role":u["role"],**mm})
+                def entity_rows(field):
+                    vals = con.execute(f"SELECT DISTINCT {field} v FROM orders WHERE {field} IS NOT NULL AND TRIM({field})<>''").fetchall()
+                    out=[]
+                    for vr in vals:
+                        val=vr["v"]
+                        ors=con.execute(f"SELECT * FROM orders WHERE {field}=?",(val,)).fetchall()
+                        ids=[o["id"] for o in ors]
+                        tasks=[]; incidents=0
+                        if ids:
+                            q=','.join('?'*len(ids))
+                            tasks=[serialize_task(r) for r in con.execute(f"SELECT * FROM tasks WHERE order_id IN ({q})",ids).fetchall()]
+                            incidents=con.execute(f"SELECT COUNT(*) c FROM incidents WHERE order_id IN ({q})",ids).fetchone()["c"]
+                        mm=metrics_for_tasks(tasks)
+                        out.append({"name":val,"orders":len(ors),"incidents":incidents,"critical":mm["critical"],"avg_ack_min":mm["avg_ack_min"],"deadline_changes":mm["deadline_changes"]})
+                    return sorted(out,key=lambda x:(-x["critical"],-(x["incidents"] or 0),x["name"]))
+                return self.send_json({"users":users_out,"carriers":entity_rows("carrier"),"clients":entity_rows("client")})
+
+            if path == "/api/dashboard":
+                user = self.require_user(con)
+                if not user: return
+                # visible orders follow role filtering; dispatcher dashboard defaults to own.
+                if user["role"] == ROLE_SUPERVISOR:
+                    order_rows = con.execute("SELECT * FROM orders").fetchall()
+                elif user["role"] == ROLE_FORWARDER:
+                    order_rows = con.execute("SELECT * FROM orders WHERE owner_forwarder_id=?", (user["id"],)).fetchall()
+                else:
+                    order_rows = con.execute("SELECT * FROM orders WHERE dispatcher_id=?", (user["id"],)).fetchall()
+                ids = [r["id"] for r in order_rows]
+                tasks = []
+                if ids:
+                    q = ",".join("?"*len(ids))
+                    tasks = [serialize_task(r) for r in con.execute(f"SELECT * FROM tasks WHERE order_id IN ({q})", ids).fetchall()]
+                metrics = metrics_for_tasks(tasks)
+                metrics["orders"] = len(order_rows)
+                metrics["orders_missing_pod"] = sum(1 for r in order_rows if not r["closed_by_pod"] and r["current_stage"] in ("Rozładunek","POD","Zamknięte"))
+                metrics["critical_missing_fields"] = sum(sum(1 for x in order_missing_fields(r) if x.get("critical")) for r in order_rows)
+                return self.send_json(metrics)
+
+        return self.send_error(404)
+
+    def do_POST(self):
+        cleanup_expired_docs()
+        path = urlparse(self.path).path
+        try:
+            data = self.json_body()
+        except Exception as e:
+            return self.send_error_json(f"Nieprawidłowe dane: {e}")
+        with db() as con:
+            if path == "/api/access":
+                if not PUBLIC_MODE:
+                    return self.send_json({"ok": True, "access_granted": True})
+                provided = str(data.get("access_key") or "")
+                if not APP_ACCESS_KEY or not hmac.compare_digest(provided, APP_ACCESS_KEY):
+                    return self.send_error_json("Nieprawidłowy klucz dostępu", 401)
+                token = secrets.token_urlsafe(32)
+                with SESSIONS_LOCK:
+                    ACCESS_SESSIONS[token] = True
+                headers = {"Set-Cookie": f"access={token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=43200"}
+                return self.send_json({"ok": True, "access_granted": True}, 200, headers)
+
+            if path == "/api/login":
+                if not self.access_granted():
+                    return self.send_error_json("Najpierw podaj klucz dostępu", 401)
+                uid = data.get("user_id")
+                u = con.execute("SELECT * FROM users WHERE id=? AND active=1", (uid,)).fetchone()
+                if not u: return self.send_error_json("Nie znaleziono użytkownika", 404)
+                token = secrets.token_urlsafe(24)
+                with SESSIONS_LOCK: SESSIONS[token] = u["id"]
+                secure = "; Secure" if PUBLIC_MODE else ""
+                headers = {"Set-Cookie": f"session={token}; Path=/; HttpOnly{secure}; SameSite=Lax; Max-Age=28800"}
+                return self.send_json({"current_user": dict(u)}, 200, headers)
+
+            if path == "/api/logout":
+                raw = self.headers.get("Cookie", "")
+                jar = cookies.SimpleCookie(); jar.load(raw)
+                if jar.get("session"):
+                    with SESSIONS_LOCK: SESSIONS.pop(jar["session"].value, None)
+                secure = "; Secure" if PUBLIC_MODE else ""
+                return self.send_json({"ok": True}, extra_headers={"Set-Cookie":f"session=; Path=/; HttpOnly{secure}; SameSite=Lax; Max-Age=0"})
+
+            if path == "/api/users":
+                user = self.require_user(con)
+                if not user: return
+                if user["role"] != ROLE_SUPERVISOR: return self.send_error_json("Tylko supervisor może tworzyć konta", 403)
+                role = data.get("role")
+                name = str(data.get("name") or "").strip()
+                username = str(data.get("username") or "").strip()
+                if role not in ROLES: return self.send_error_json("Nieprawidłowa rola")
+                if not name or not username: return self.send_error_json("Nazwa i login są wymagane")
+                try:
+                    cur = con.execute("INSERT INTO users(name,username,role,created_at) VALUES(?,?,?,?)", (name, username, role, now_iso()))
+                except sqlite3.IntegrityError:
+                    return self.send_error_json("Login już istnieje", 409)
+                return self.send_json({"id": cur.lastrowid}, 201)
+
+            if path == "/api/orders":
+                user = self.require_user(con)
+                if not user: return
+                ts = now_iso()
+                order_no = (data.get("order_no") or "").strip() or None
+                if data.get("generate_number"):
+                    # Serialize automatic numbering so simultaneous creates cannot pick the same next number.
+                    con.execute("BEGIN IMMEDIATE")
+                    order_no = generate_order_number(con)
+                required_create = {
+                    "load_code": "kod załadunku", "unload_code": "kod rozładunku",
+                    "vehicle_type": "typ auta", "cargo": "towar",
+                    "load_deadline": "termin załadunku", "unload_deadline": "termin rozładunku"
+                }
+                missing_create = [label for key,label in required_create.items() if not str(data.get(key) or "").strip()]
+                if missing_create:
+                    return self.send_error_json("Brak obowiązkowych danych: " + ", ".join(missing_create))
+                owner = data.get("owner_forwarder_id")
+                dispatcher = data.get("dispatcher_id")
+                if user["role"] == ROLE_FORWARDER and not owner: owner = user["id"]
+                if user["role"] == ROLE_DISPATCHER and not dispatcher: dispatcher = user["id"]
+                if owner and not valid_user_for_role(con, owner, ROLE_FORWARDER):
+                    return self.send_error_json("Przypisany spedytor nie istnieje albo ma złą rolę")
+                if dispatcher and not valid_user_for_role(con, dispatcher, ROLE_DISPATCHER):
+                    return self.send_error_json("Przypisany dyspozytor nie istnieje albo ma złą rolę")
+                ball = data.get("ball_holder_role") or ROLE_DISPATCHER
