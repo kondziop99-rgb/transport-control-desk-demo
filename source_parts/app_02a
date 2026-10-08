@@ -1,0 +1,98 @@
+tchall()
+        m["reactions"] = {r["reaction"]: r["c"] for r in reacts}
+    tasks = [serialize_task(r) for r in con.execute(
+        "SELECT t.*, u.name AS assigned_name, c.name AS created_name FROM tasks t LEFT JOIN users u ON u.id=t.assigned_to LEFT JOIN users c ON c.id=t.created_by WHERE t.order_id=? ORDER BY CASE WHEN t.status='resolved' THEN 1 ELSE 0 END, t.deadline, t.id", (order_id,)
+    ).fetchall()]
+    milestones = [dict(r) for r in con.execute(
+        "SELECT m.*,u.name AS owner_name FROM milestones m LEFT JOIN users u ON u.id=m.owner_user_id WHERE m.order_id=? ORDER BY seq,id", (order_id,)
+    ).fetchall()]
+    audits = [dict(r) for r in con.execute(
+        "SELECT a.*,u.name AS user_name FROM audit a LEFT JOIN users u ON u.id=a.user_id WHERE a.order_id=? ORDER BY a.id DESC", (order_id,)
+    ).fetchall()]
+    for a in audits:
+        a["details_obj"] = jloads(a.get("details"), {})
+        a["comments"] = [dict(x) for x in con.execute("SELECT c.*,u.name AS user_name FROM audit_comments c JOIN users u ON u.id=c.user_id WHERE c.audit_id=? ORDER BY c.id", (a["id"],)).fetchall()]
+    docs = [dict(r) for r in con.execute(
+        "SELECT d.*,u.name AS user_name FROM documents d JOIN users u ON u.id=d.user_id WHERE d.order_id=? ORDER BY d.id DESC", (order_id,)
+    ).fetchall()]
+    n = now_dt()
+    for d in docs:
+        exp = parse_iso(d["expires_at"])
+        d["days_left"] = int((exp-n).total_seconds()//86400) if exp else None
+        d["warning"] = bool(exp and exp <= n + timedelta(days=7))
+    incidents = [dict(r) for r in con.execute(
+        "SELECT i.*,u.name AS created_name FROM incidents i JOIN users u ON u.id=i.created_by WHERE i.order_id=? ORDER BY i.id DESC", (order_id,)
+    ).fetchall()]
+    return {
+        "order": order,
+        "messages": messages,
+        "tasks": tasks,
+        "milestones": milestones,
+        "audit": audits,
+        "documents": docs,
+        "incidents": incidents,
+    }
+
+
+def metrics_for_tasks(tasks):
+    ack = [t["ack_minutes"] for t in tasks if t.get("ack_minutes") is not None]
+    res = [t["resolution_minutes"] for t in tasks if t.get("resolution_minutes") is not None]
+    return {
+        "tasks_total": len(tasks),
+        "tasks_open": sum(1 for t in tasks if t["status"] != "resolved"),
+        "late": sum(1 for t in tasks if t["sla_state"] == "late"),
+        "critical": sum(1 for t in tasks if t["sla_state"] == "critical"),
+        "ack_missing": sum(1 for t in tasks if t["status"] != "resolved" and not t["ack_at"]),
+        "avg_ack_min": round(sum(ack)/len(ack), 1) if ack else None,
+        "avg_resolution_min": round(sum(res)/len(res), 1) if res else None,
+        "deadline_changes": sum(t["deadline_changed_count"] for t in tasks),
+    }
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "TransportCommsMVP/1.0"
+
+    def log_message(self, fmt, *args):
+        print(f"[{self.log_date_time_string()}] {self.client_address[0]} {fmt % args}")
+
+    def json_body(self):
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length > 15 * 1024 * 1024:
+            raise ValueError("Payload too large")
+        raw = self.rfile.read(length) if length else b"{}"
+        return json.loads(raw.decode("utf-8")) if raw else {}
+
+    def send_json(self, data, status=200, extra_headers=None):
+        body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.security_headers()
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_error_json(self, msg, status=400):
+        self.send_json({"error": msg}, status)
+
+    def _cookie_jar(self):
+        raw = self.headers.get("Cookie", "")
+        jar = cookies.SimpleCookie()
+        try:
+            jar.load(raw)
+        except Exception:
+            pass
+        return jar
+
+    def access_granted(self):
+        if not PUBLIC_MODE:
+            return True
+        jar = self._cookie_jar()
+        morsel = jar.get("access")
+        if not morsel:
+            return False
+        with SESSIONS_LOCK:
+            return bool(ACCESS_SESSIONS.get(morsel.value))
