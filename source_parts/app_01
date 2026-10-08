@@ -1,0 +1,226 @@
+N")
+    con.execute("PRAGMA busy_timeout=15000")
+    con.execute("PRAGMA journal_mode=WAL")
+    return con
+
+
+def init_db():
+    with db() as con:
+        con.executescript(SCHEMA)
+        count = con.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+        if count == 0:
+            ts = now_iso()
+            con.executemany(
+                "INSERT INTO users(name,username,role,created_at) VALUES (?,?,?,?)",
+                [
+                    ("Konrad Demo", "konrad", ROLE_FORWARDER, ts),
+                    ("Dyspozytor Demo", "dispatch", ROLE_DISPATCHER, ts),
+                    ("Supervisor Demo", "supervisor", ROLE_SUPERVISOR, ts),
+                ],
+            )
+
+
+def rowdict(row):
+    return dict(row) if row else None
+
+
+def jloads(s, fallback=None):
+    try:
+        return json.loads(s) if s else fallback
+    except Exception:
+        return fallback
+
+
+def add_audit(con, order_id, user_id, event_type, source, summary, details=None, verification="system"):
+    con.execute(
+        "INSERT INTO audit(order_id,user_id,event_type,source,summary,details,verification,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        (order_id, user_id, event_type, source, summary, json.dumps(details, ensure_ascii=False) if details is not None else None, verification, now_iso()),
+    )
+
+
+def cleanup_expired_docs(force=False):
+    global LAST_CLEANUP
+    now_mono = time.monotonic()
+    if not force and now_mono - LAST_CLEANUP < 30:
+        return
+    if not CLEANUP_LOCK.acquire(blocking=False):
+        return
+    try:
+        LAST_CLEANUP = now_mono
+        n = now_dt()
+        with db() as con:
+            rows = con.execute("SELECT * FROM documents").fetchall()
+            for r in rows:
+                exp = parse_iso(r["expires_at"])
+                if not exp or exp > n:
+                    continue
+                path = UPLOADS / r["stored_name"]
+                try:
+                    if path.exists():
+                        path.unlink()
+                except Exception:
+                    pass
+                add_audit(con, r["order_id"], None, "document_deleted", "automation", f"Dokument usunięty po terminie: {r['filename']}", {"document_id": r["id"], "expires_at": r["expires_at"]})
+                con.execute("DELETE FROM documents WHERE id=?", (r["id"],))
+    finally:
+        CLEANUP_LOCK.release()
+
+
+def can_access_order(con, user, order_id, allow_dispatcher_all=True):
+    if not user:
+        return False
+    order = con.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    if not order:
+        return False
+    if user["role"] == ROLE_SUPERVISOR:
+        return True
+    if user["role"] == ROLE_FORWARDER:
+        return order["owner_forwarder_id"] == user["id"]
+    if user["role"] == ROLE_DISPATCHER:
+        return allow_dispatcher_all or order["dispatcher_id"] == user["id"]
+    return False
+
+
+def order_missing_fields(order):
+    missing = []
+    required = {
+        "load_code": "kod załadunku", "unload_code": "kod rozładunku", "vehicle_type": "typ auta",
+        "cargo": "towar", "load_deadline": "termin załadunku", "unload_deadline": "termin rozładunku",
+        "carrier": "przewoźnik", "carrier_phone": "telefon przewoźnika", "driver_name": "kierowca",
+        "driver_phone": "telefon kierowcy", "tractor_plate": "blachy ciągnika", "gps_link": "GPS"
+    }
+    for key, label in required.items():
+        val = order[key]
+        if not val or (isinstance(val, str) and val.strip().upper() == "TBD"):
+            missing.append({"field": key, "label": label, "critical": key in {"carrier", "carrier_phone", "driver_name", "driver_phone", "tractor_plate", "gps_link"}})
+    reqs = (order["requirements"] or "").lower()
+    if "custom" in reqs or "cel" in reqs:
+        # Customs documents are represented by uploaded docs or audit entries; mark as soft warning here.
+        missing.append({"field": "customs_docs", "label": "weryfikacja dokumentów celnych", "critical": True, "conditional": True})
+    return missing
+
+
+def task_state(task):
+    if task["status"] == "resolved":
+        return "resolved"
+    if task["no_deadline"] or not task["deadline"]:
+        return "open"
+    dl = parse_iso(task["deadline"])
+    if not dl:
+        return "open"
+    n = now_dt()
+    if n <= dl:
+        return "open"
+    if n <= dl + timedelta(minutes=30):
+        return "late"
+    return "critical"
+
+
+def serialize_task(task):
+    d = dict(task)
+    d["sla_state"] = task_state(task)
+    created = parse_iso(task["created_at"])
+    d["assumed_read_at"] = (created + timedelta(minutes=5)).isoformat(timespec="seconds") if created else None
+    if created and task["ack_at"]:
+        ack = parse_iso(task["ack_at"])
+        d["ack_minutes"] = round((ack-created).total_seconds()/60, 1) if ack else None
+    else:
+        d["ack_minutes"] = None
+    if created and task["resolved_at"]:
+        resolved = parse_iso(task["resolved_at"])
+        d["resolution_minutes"] = round((resolved-created).total_seconds()/60, 1) if resolved else None
+    else:
+        d["resolution_minutes"] = None
+    return d
+
+
+def auto_tags(text):
+    t = text.lower()
+    tags = []
+    checks = [
+        ("gps", ["gps", "tracking", "pozycj"]),
+        ("vehicle", ["blach", "plate", "rejestr", "vehicle", "truck"]),
+        ("driver", ["kierow", "driver"]),
+        ("eta", ["eta", "arrival", "przyjazd"]),
+        ("document", ["cmr", "pod", "document", "dokument"]),
+        ("customs", ["custom", "celn", "t1", "gmr", "ata"]),
+        ("delay", ["delay", "late", "opóź", "spóź"]),
+        ("missing", ["brak", "missing"]),
+    ]
+    for tag, words in checks:
+        if any(w in t for w in words):
+            tags.append(tag)
+    return tags
+
+
+def default_deadline(template_key):
+    minutes = TASK_TEMPLATES.get(template_key, TASK_TEMPLATES["other"])[1]
+    return (now_dt() + timedelta(minutes=minutes)).isoformat(timespec="seconds")
+
+
+def generate_order_number(con):
+    n = now_dt()
+    suffix = f"/TRNS/{n.month:02d}/{str(n.year)[-2:]}"
+    rows = con.execute("SELECT order_no FROM orders WHERE order_no LIKE ?", ("%" + suffix,)).fetchall()
+    highest = 0
+    for r in rows:
+        m = re.match(r"^(\d{5})/TRNS/\d{2}/\d{2}$", r["order_no"] or "")
+        if m:
+            highest = max(highest, int(m.group(1)))
+    for candidate in range(highest + 1, 100000):
+        value = f"{candidate:05d}{suffix}"
+        if not con.execute("SELECT 1 FROM orders WHERE order_no=?", (value,)).fetchone():
+            return value
+    raise RuntimeError("Brak wolnych numerów")
+
+
+def create_task(con, order_id, user_id, data, source_message_id=None):
+    template_key = data.get("template_key") or "other"
+    if template_key not in TASK_TEMPLATES:
+        template_key = "other"
+    title = (data.get("title") or TASK_TEMPLATES[template_key][0]).strip()
+    no_deadline = 1 if data.get("no_deadline") else 0
+    deadline = None if no_deadline else (data.get("deadline") or default_deadline(template_key))
+    assigned_to = data.get("assigned_to") or None
+    if assigned_to and not valid_active_user(con, assigned_to):
+        raise ValueError("Przypisany użytkownik nie istnieje lub jest nieaktywny")
+    ts = now_iso()
+    cur = con.execute(
+        "INSERT INTO tasks(order_id,created_by,assigned_to,title,template_key,deadline,no_deadline,source_message_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (order_id, user_id, assigned_to, title, template_key, deadline, no_deadline, source_message_id, ts, ts)
+    )
+    task_id = cur.lastrowid
+    add_audit(con, order_id, user_id, "task_created", "chat" if source_message_id else "task", f"Utworzono zadanie: {title}", {"task_id": task_id, "template": template_key, "assigned_to": assigned_to, "deadline": deadline, "no_deadline": bool(no_deadline)})
+    return task_id
+
+
+def user_name(con, uid):
+    if not uid:
+        return None
+    row = con.execute("SELECT name FROM users WHERE id=?", (uid,)).fetchone()
+    return row["name"] if row else None
+
+
+def valid_user_for_role(con, uid, role):
+    if uid in (None, "", 0, "0"):
+        return True
+    row = con.execute("SELECT id FROM users WHERE id=? AND role=? AND active=1", (uid, role)).fetchone()
+    return bool(row)
+
+
+def valid_active_user(con, uid):
+    if uid in (None, "", 0, "0"):
+        return True
+    return bool(con.execute("SELECT 1 FROM users WHERE id=? AND active=1", (uid,)).fetchone())
+
+
+def get_order_bundle(con, order_id):
+    order = rowdict(con.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone())
+    if not order:
+        return None
+    order["missing_fields"] = order_missing_fields(order)
+    messages = [dict(r) for r in con.execute(
+        "SELECT m.*, u.name AS user_name, u.role AS user_role FROM messages m JOIN users u ON u.id=m.user_id WHERE m.order_id=? ORDER BY m.id", (order_id,)
+    ).fetchall()]
+    for m in messages:
+        reacts = con.execute("SELECT reaction, COUNT(*) c FROM message_reactions WHERE message_id=? GROUP BY reaction", (m["id"],)).fe
