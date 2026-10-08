@@ -1,0 +1,70 @@
+const S = { user:null, users:[], orders:[], order:null, bootstrap:null, activeView:'dashboard', activeTab:'overview', replyTo:null };
+const $ = s => document.querySelector(s); const $$ = s => [...document.querySelectorAll(s)];
+const esc = v => String(v ?? '').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt = v => { if(!v) return '—'; const d=new Date(v); return isNaN(d)?esc(v):d.toLocaleString('pl-PL',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}); };
+const api = async (url,opt={}) => { const r=await fetch(url,{headers:{'Content-Type':'application/json',...(opt.headers||{})},...opt}); const j=await r.json().catch(()=>({})); if(!r.ok) throw new Error(j.error||`HTTP ${r.status}`); return j; };
+function toast(msg,err=false){ const t=$('#toast'); t.textContent=msg; t.className='toast'+(err?' error':''); setTimeout(()=>t.classList.add('hidden'),3000); }
+function showModal(html){ $('#modalBody').innerHTML=html; $('#modal').classList.remove('hidden'); }
+function closeModal(){ $('#modal').classList.add('hidden'); }
+$('#modal').addEventListener('click',e=>{if(e.target.id==='modal') closeModal();});
+setInterval(()=>$('#clock').textContent=new Date().toLocaleString('pl-PL'),1000);
+
+async function boot(){
+  S.bootstrap=await api('/api/bootstrap'); S.users=S.bootstrap.users; S.user=S.bootstrap.current_user;
+  if(!S.user){ renderLogin(); return; }
+  $('#loginScreen').classList.add('hidden'); $('#shell').classList.remove('hidden'); renderUser(); await refreshOrders(); await renderDashboard(); bindNav();
+}
+function renderLogin(){
+  $('#shell').classList.add('hidden'); $('#loginScreen').classList.remove('hidden');
+  const card=$('#loginScreen .login-card');
+  if(S.bootstrap.public_mode && !S.bootstrap.access_granted){
+    card.innerHTML=`<div class="eyebrow">PUBLIC DEMO · ACCESS GATE</div><h1>Klucz dostępu</h1><p>Ta wersja jest dostępna przez Internet. Wprowadź klucz demo, aby zobaczyć konta testowe.</p><div class="field"><label>Klucz</label><input id="accessKey" type="password" autocomplete="current-password" placeholder="••••••••"></div><button class="primary full" onclick="unlock()">Otwórz aplikację</button><div id="accessError" class="muted" style="margin-top:10px"></div>`;
+    setTimeout(()=>$('#accessKey')?.focus(),0); return;
+  }
+  card.innerHTML=`<div class="eyebrow">${S.bootstrap.public_mode?'PUBLIC DEMO':'OFFLINE / LAN MVP'}</div><h1>Wybierz konto</h1><p>${S.bootstrap.public_mode?'Dostęp testowy. Dane na darmowym hostingu mogą być nietrwałe.':'Symulacja logowania bez haseł. Konta i role są przechowywane lokalnie.'}</p><div id="loginUsers" class="login-users"></div>`;
+  $('#loginUsers').innerHTML=S.users.map(u=>`<button class="login-user" onclick="login(${u.id})"><strong>${esc(u.name)}</strong><span>${esc(u.role)}</span></button>`).join('');
+}
+async function unlock(){
+  const key=$('#accessKey')?.value||'';
+  try{await api('/api/access',{method:'POST',body:JSON.stringify({access_key:key})}); location.reload();}
+  catch(e){const el=$('#accessError');if(el)el.textContent=e.message;}
+}
+async function login(id){ await api('/api/login',{method:'POST',body:JSON.stringify({user_id:id})}); location.reload(); }
+async function logout(){ await api('/api/logout',{method:'POST',body:'{}'}); location.reload(); }
+function renderUser(){
+  $('#userArea').innerHTML=`<div class="user-pill"><div><b>${esc(S.user.name)}</b><div class="role">${esc(S.user.role)}</div></div><button class="mini" onclick="logout()">wyloguj</button></div>`;
+  $('#supervisorBox').classList.toggle('hidden',S.user.role!=='supervisor');
+  $('#dispatcherAllWrap').classList.toggle('hidden',S.user.role!=='dyspozytor');
+  $('#createUserBtn')?.addEventListener('click',createUserModal);
+}
+function bindNav(){
+  $$('.navbtn').forEach(b=>b.onclick=()=>switchView(b.dataset.view));
+  $('#newOrderBtn').onclick=createOrderModal;
+  $('#dispatcherAll').onchange=refreshOrders;
+}
+function switchView(v){ S.activeView=v; $$('.view').forEach(x=>x.classList.add('hidden')); $$('.navbtn').forEach(x=>x.classList.toggle('active',x.dataset.view===v)); if(v==='dashboard'){ $('#dashboardView').classList.remove('hidden'); renderDashboard(); } if(v==='orders'){ $('#ordersView').classList.remove('hidden'); renderOrdersTable(); } }
+async function refreshOrders(){ const all=$('#dispatcherAll')?.checked?'1':'0'; const j=await api('/api/orders?all='+all); S.orders=j.orders; renderOrderList(); if(S.activeView==='orders') renderOrdersTable(); }
+function renderOrderList(){
+  $('#orderList').innerHTML=S.orders.length?S.orders.map(o=>`<div class="order-item ${S.order?.order?.id===o.id?'active':''}" onclick="openOrder(${o.id})"><div class="order-title">${esc(o.order_no||'TEMP #'+o.id)}</div><div class="order-route">${esc(o.load_code||'?')} → ${esc(o.unload_code||'?')}</div><div class="order-badges">${o.critical_tasks?`<span class="badge danger">critical ${o.critical_tasks}</span>`:''}${o.open_tasks?`<span class="badge warn">task ${o.open_tasks}</span>`:''}${o.missing_count?`<span class="badge">braki ${o.missing_count}</span>`:''}</div></div>`).join(''):'<div class="empty">Brak zleceń</div>';
+}
+async function renderDashboard(){
+  if(!S.user) return; const m=await api('/api/dashboard');
+  $('#dashboardView').innerHTML=`<div class="view-header"><div><h1>Dashboard operacyjny</h1><div class="sub">Widok: ${esc(S.user.name)} · ${esc(S.user.role)}</div></div></div>
+  <div class="cards">
+   ${metric('Zlecenia',m.orders,'w aktualnym zakresie')}${metric('Otwarte zadania',m.tasks_open,'oczekują na informację',m.tasks_open?'warn':'ok')}${metric('Critical',m.critical,'SLA +30 min',m.critical?'danger':'ok')}${metric('Braki krytyczne',m.critical_missing_fields,'dane operacyjne',m.critical_missing_fields?'danger':'ok')}
+   ${metric('Śr. ACK',m.avg_ack_min==null?'—':m.avg_ack_min+' min','pierwsza reakcja')}${metric('Śr. rozwiązanie',m.avg_resolution_min==null?'—':m.avg_resolution_min+' min','pełna informacja')}${metric('ACK bez reakcji',m.ack_missing,'otwarte zadania',m.ack_missing?'warn':'ok')}${metric('Zmiany deadline',m.deadline_changes,'liczone do KPI')}
+  </div>
+  <div class="grid2"><div class="panel"><h3>Dlaczego ten dashboard istnieje</h3><p>Nie mierzymy liczby wiadomości. Mierzymy, czy informacja została zamówiona, przyjęta, dostarczona i czy wiadomo, kto obecnie odpowiada za następny ruch.</p></div><div class="panel"><h3>Sygnały ryzyka</h3><div class="order-badges"><span class="badge danger">critical = deadline + 30 min</span><span class="badge warn">late = po deadline</span><span class="badge blue">ACK = pierwsza reakcja</span></div></div></div><div id="supervisorPerformance"></div>`;
+  if(S.user.role==='supervisor') renderPerformance();
+}
+
+async function renderPerformance(){const p=await api('/api/performance');const el=$('#supervisorPerformance');if(!el)return;const userRows=[...p.users].sort((a,b)=>(b.critical-a.critical)||((b.avg_ack_min||0)-(a.avg_ack_min||0)));el.innerHTML=`<div class="grid2"><div class="panel"><h3>Problem map · użytkownicy</h3><table class="table"><thead><tr><th>Osoba</th><th>Rola</th><th>Critical</th><th>Śr. ACK</th><th>Deadline Δ</th></tr></thead><tbody>${userRows.map(x=>`<tr><td>${esc(x.name)}</td><td>${esc(x.role)}</td><td>${x.critical}</td><td>${x.avg_ack_min==null?'—':x.avg_ack_min+'m'}</td><td>${x.deadline_changes}</td></tr>`).join('')}</tbody></table></div><div class="panel"><h3>Przewoźnicy / klienci</h3><table class="table"><thead><tr><th>Podmiot</th><th>Zlecenia</th><th>Incydenty</th><th>Critical</th></tr></thead><tbody>${p.carriers.slice(0,6).map(x=>`<tr><td>${esc(x.name)}</td><td>${x.orders}</td><td>${x.incidents}</td><td>${x.critical}</td></tr>`).join('')}${p.clients.slice(0,4).map(x=>`<tr><td>${esc(x.name)} <span class="muted">(client)</span></td><td>${x.orders}</td><td>${x.incidents}</td><td>${x.critical}</td></tr>`).join('')}</tbody></table></div></div>`}
+function metric(l,v,n,c=''){return `<div class="card"><div class="metric-label">${l}</div><div class="metric-value ${c}">${v}</div><div class="metric-note">${n}</div></div>`}
+function renderOrdersTable(){
+  $('#ordersView').innerHTML=`<div class="view-header"><div><h1>Zlecenia</h1><div class="sub">Jedno miejsce dla aktualnego stanu i historii</div></div><button class="primary" onclick="createOrderModal()">+ Nowe</button></div><div class="panel"><table class="table"><thead><tr><th>Nr</th><th>Trasa</th><th>Etap</th><th>Spedytor</th><th>Dyspozytor</th><th>Piłka</th><th>Ryzyko</th></tr></thead><tbody>${S.orders.map(o=>`<tr onclick="openOrder(${o.id})" style="cursor:pointer"><td><b>${esc(o.order_no||'TEMP #'+o.id)}</b></td><td>${esc(o.load_code||'?')} → ${esc(o.unload_code||'?')}</td><td>${esc(o.current_stage)}</td><td>${esc(o.owner_name||'—')}</td><td>${esc(o.dispatcher_name||'—')}</td><td>${esc(o.ball_holder_role||'—')}</td><td>${o.critical_tasks?`<span class="badge danger">${o.critical_tasks} critical</span>`:o.missing_count?`<span class="badge warn">${o.missing_count} braków</span>`:'<span class="badge ok">OK</span>'}</td></tr>`).join('')}</tbody></table></div>`;
+}
+async function openOrder(id){
+  S.order=await api('/api/orders/'+id); S.activeView='order'; S.activeTab='overview'; renderOrderList(); $$('.view').forEach(x=>x.classList.add('hidden')); $('#orderView').classList.remove('hidden'); $$('.navbtn').forEach(x=>x.classList.remove('active')); renderOrder();
+}
+function renderOrder(){ const o=S.order.order; $('#orderView').innerHTML=`<div class="order-head"><div><div class="eyebrow">${esc(o.current_stage||'')}</div><h1>${esc(o.order_no||'TEMP #'+o.id)}</h1><div class="route-big">${esc(o.load_code||'?')} → ${esc(o.unload_code||'?')} · ${esc(o.vehicle_type||'typ auta ?')}</div></div><div class="responsibility"><div class="chip">Owner: <b>${esc(nameOf(o.owner_forwarder_id)||'—')}</b></div><div class="chip">Dispatcher: <b>${esc(nameOf(o.dispatcher_id)||'—')}</b></div><div class="chip ball">PIŁKA: <b>${esc(o.ball_holder_role||'—')}</b></div></div></div><div class="tabs">${[['overview','Dane'],['chat','Chat + SLA'],['timeline','Historia'],['milestones','Milestones'],['documents','Dokumenty'],['incidents','Incydenty'],['stats','Statystyka']].map(([k,l])=>`<button class="tab ${S.activeTab===k?'active':''}" onclick="tab('${k}')">${l}</button>`).join('')}</div><div id="tabBody"></div>`; renderTab(); }
+function tab(k){S.activeTab=k; renderOrder();}
