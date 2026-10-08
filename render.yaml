@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: transport-control-desk-demo
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: python -m compileall -q .
+    startCommand: python bootstrap.py --host 0.0.0.0
+    healthCheckPath: /api/health
+    envVars:
+      - key: PUBLIC_MODE
+        value: "1"
+      - key: APP_ACCESS_KEY
+        sync: false
+      - key: DATA_DIR
+        value: /tmp/transport-control-desk
