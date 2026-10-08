@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Transport Control Desk</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">TC</div>
+        <div><b>Transport Control Desk</b><small>pewność wykonania przez kontrolę informacji</small></div>
+      </div>
+      <div class="top-actions">
+        <span id="clock"></span>
+        <div id="userArea"></div>
+      </div>
+    </header>
+
+    <div id="loginScreen" class="login-screen hidden">
+      <div class="login-card">
+        <div class="eyebrow">OFFLINE / LAN MVP</div>
+        <h1>Wybierz konto</h1>
+        <p>Symulacja logowania bez haseł. Konta i role są przechowywane lokalnie.</p>
+        <div id="loginUsers" class="login-users"></div>
+      </div>
+    </div>
+
+    <div id="shell" class="shell hidden">
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <button class="navbtn active" data-view="dashboard">Dashboard</button>
+          <button class="navbtn" data-view="orders">Zlecenia</button>
+          <button id="newOrderBtn" class="primary">+ Nowe zlecenie</button>
+        </div>
+        <div class="sidebar-section">
+          <div class="section-title">Aktywne zlecenia</div>
+          <label id="dispatcherAllWrap" class="checkline hidden"><input id="dispatcherAll" type="checkbox"> pokaż wszystkie</label>
+          <div id="orderList" class="order-list"></div>
+        </div>
+        <div id="supervisorBox" class="sidebar-section hidden">
+          <div class="section-title">Supervisor</div>
+          <button id="createUserBtn" class="ghost full">+ Utwórz konto</button>
+        </div>
+      </aside>
+
+      <main class="main">
+        <section id="dashboardView" class="view"></section>
+        <section id="ordersView" class="view hidden"></section>
+        <section id="orderView" class="view hidden"></section>
+      </main>
+    </div>
+
+    <div id="modal" class="modal hidden"><div class="modal-card"><div id="modalBody"></div></div></div>
+    <div id="toast" class="toast hidden"></div>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
