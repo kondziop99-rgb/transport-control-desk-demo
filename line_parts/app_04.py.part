@@ -1,0 +1,140 @@
+                if ball not in ROLES:
+                    return self.send_error_json("Nieprawidłowa wartość pola: piłka po stronie")
+                try:
+                    cur = con.execute("""
+                        INSERT INTO orders(order_no,title,load_code,unload_code,vehicle_type,cargo,load_deadline,unload_deadline,client,carrier,carrier_phone,carrier_other_contact,driver_name,driver_phone,tractor_plate,trailer_plate,gps_link,gps_type,gps_received_at,gps_expires_at,cargo_value,insurance_info,requirements,owner_forwarder_id,dispatcher_id,ball_holder_role,created_by,created_at,updated_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (
+                        order_no, data.get("title"), data.get("load_code"), data.get("unload_code"), data.get("vehicle_type"), data.get("cargo"), data.get("load_deadline"), data.get("unload_deadline"), data.get("client"), data.get("carrier") or "TBD", data.get("carrier_phone"), data.get("carrier_other_contact"), data.get("driver_name"), data.get("driver_phone"), data.get("tractor_plate"), data.get("trailer_plate"), data.get("gps_link"), data.get("gps_type"), data.get("gps_received_at"), data.get("gps_expires_at"), data.get("cargo_value"), data.get("insurance_info"), data.get("requirements"), owner, dispatcher, ball, user["id"], ts, ts
+                    ))
+                except sqlite3.IntegrityError:
+                    return self.send_error_json("Numer zlecenia już istnieje", 409)
+                oid = cur.lastrowid
+                for name, seq in [("Załadunek",100),("W trasie",200),("Rozładunek",300),("POD received",400),("Order closed",500)]:
+                    con.execute("INSERT INTO milestones(order_id,name,seq,created_at) VALUES(?,?,?,?)", (oid,name,seq,ts))
+                add_audit(con, oid, user["id"], "order_created", "system", "Utworzono zlecenie", {"order_no": order_no, "temporary": order_no is None})
+                return self.send_json({"id": oid}, 201)
+
+            m = re.fullmatch(r"/api/orders/(\d+)/messages", path)
+            if m:
+                user = self.require_user(con)
+                if not user: return
+                oid = int(m.group(1))
+                if not can_access_order(con, user, oid, True): return self.send_error_json("Brak dostępu",403)
+                text = (data.get("text") or "").strip()
+                if not text: return self.send_error_json("Pusta wiadomość")
+                if data.get("task") and data["task"].get("assigned_to") and not valid_active_user(con, data["task"].get("assigned_to")):
+                    return self.send_error_json("Przypisany użytkownik nie istnieje lub jest nieaktywny")
+                reply_to = data.get("reply_to_id")
+                if reply_to:
+                    parent = con.execute("SELECT order_id FROM messages WHERE id=?", (reply_to,)).fetchone()
+                    if not parent or parent["order_id"] != oid:
+                        return self.send_error_json("Odpowiedź może wskazywać tylko wiadomość z tego samego zlecenia")
+                cur = con.execute("INSERT INTO messages(order_id,user_id,text,reply_to_id,created_at) VALUES(?,?,?,?,?)", (oid,user["id"],text,reply_to,now_iso()))
+                mid = cur.lastrowid
+                tags = auto_tags(text)
+                add_audit(con, oid, user["id"], "message", "chat", f"Wiadomość: {text[:180]}", {"message_id":mid,"tags":tags})
+                if data.get("task"):
+                    create_task(con, oid, user["id"], data["task"], mid)
+                return self.send_json({"id":mid},201)
+
+            m = re.fullmatch(r"/api/messages/(\d+)/reactions", path)
+            if m:
+                user = self.require_user(con)
+                if not user: return
+                mid = int(m.group(1)); reaction = data.get("reaction")
+                if reaction not in {"👍","ACK","IMPORTANT"}: return self.send_error_json("Nieprawidłowa reakcja")
+                msg = con.execute("SELECT * FROM messages WHERE id=?",(mid,)).fetchone()
+                if not msg or not can_access_order(con,user,msg["order_id"],True): return self.send_error_json("Brak dostępu",403)
+                try:
+                    con.execute("INSERT INTO message_reactions(message_id,user_id,reaction,created_at) VALUES(?,?,?,?)",(mid,user["id"],reaction,now_iso()))
+                except sqlite3.IntegrityError:
+                    con.execute("DELETE FROM message_reactions WHERE message_id=? AND user_id=? AND reaction=?",(mid,user["id"],reaction))
+                return self.send_json({"ok":True})
+
+            m = re.fullmatch(r"/api/orders/(\d+)/tasks", path)
+            if m:
+                user = self.require_user(con)
+                if not user: return
+                oid=int(m.group(1))
+                if not can_access_order(con,user,oid,True): return self.send_error_json("Brak dostępu",403)
+                try:
+                    tid=create_task(con,oid,user["id"],data)
+                except ValueError as e:
+                    return self.send_error_json(str(e))
+                return self.send_json({"id":tid},201)
+
+            m = re.fullmatch(r"/api/orders/(\d+)/milestones", path)
+            if m:
+                user=self.require_user(con)
+                if not user:return
+                oid=int(m.group(1))
+                if not can_access_order(con,user,oid,True): return self.send_error_json("Brak dostępu",403)
+                name=(data.get("name") or "").strip()
+                if not name:return self.send_error_json("Brak nazwy")
+                seq=float(data.get("seq") or 250)
+                if data.get("owner_user_id") and not valid_active_user(con, data.get("owner_user_id")):
+                    return self.send_error_json("Owner milestone nie istnieje lub jest nieaktywny")
+                cur=con.execute("INSERT INTO milestones(order_id,name,seq,status,deadline,owner_user_id,comment,checklist,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(oid,name,seq,data.get("status") or "pending",data.get("deadline"),data.get("owner_user_id"),data.get("comment"),json.dumps(data.get("checklist") or [],ensure_ascii=False),now_iso()))
+                add_audit(con,oid,user["id"],"milestone_created","status",f"Dodano milestone: {name}",{"milestone_id":cur.lastrowid})
+                return self.send_json({"id":cur.lastrowid},201)
+
+            m = re.fullmatch(r"/api/orders/(\d+)/documents", path)
+            if m:
+                user=self.require_user(con)
+                if not user:return
+                oid=int(m.group(1))
+                if not can_access_order(con,user,oid,True): return self.send_error_json("Brak dostępu",403)
+                filename=os.path.basename(data.get("filename") or "document.bin")
+                content=data.get("content_base64") or ""
+                try: raw=base64.b64decode(content,validate=True)
+                except Exception:return self.send_error_json("Nieprawidłowy plik")
+                if len(raw)>10*1024*1024:return self.send_error_json("Maksymalny rozmiar pliku to 10 MB",413)
+                stored=hashlib.sha256((secrets.token_hex(8)+filename+now_iso()).encode()).hexdigest()[:24]+Path(filename).suffix[:10]
+                (UPLOADS/stored).write_bytes(raw)
+                expires_raw=data.get("expires_at") or (now_dt()+timedelta(days=30)).isoformat(timespec="seconds")
+                expires_dt=parse_iso(expires_raw)
+                if not expires_dt:
+                    try: (UPLOADS/stored).unlink(missing_ok=True)
+                    except Exception: pass
+                    return self.send_error_json("Nieprawidłowy termin ważności dokumentu")
+                expires=expires_dt.isoformat(timespec="seconds")
+                cur=con.execute("INSERT INTO documents(order_id,user_id,filename,stored_name,mime,size,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?)",(oid,user["id"],filename,stored,data.get("mime") or mimetypes.guess_type(filename)[0],len(raw),expires,now_iso()))
+                add_audit(con,oid,user["id"],"document_uploaded","document",f"Wgrano dokument: {filename}",{"document_id":cur.lastrowid,"expires_at":expires,"size":len(raw)})
+                return self.send_json({"id":cur.lastrowid},201)
+
+            m = re.fullmatch(r"/api/orders/(\d+)/incidents", path)
+            if m:
+                user=self.require_user(con)
+                if not user:return
+                oid=int(m.group(1))
+                if not can_access_order(con,user,oid,True): return self.send_error_json("Brak dostępu",403)
+                ts=now_iso()
+                category=data.get("category") or "external"
+                status=data.get("status") or "open"
+                if category not in {"carrier","dispatch","forwarder","client","customs","external"}:
+                    return self.send_error_json("Nieprawidłowa kategoria incydentu")
+                if status not in {"open","investigating","closed"}:
+                    return self.send_error_json("Nieprawidłowy status incydentu")
+                accepted=data.get("root_cause_accepted") if user["role"] in (ROLE_FORWARDER, ROLE_SUPERVISOR) else None
+                cur=con.execute("INSERT INTO incidents(order_id,created_by,category,title,description,root_cause_suggested,root_cause_accepted,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(oid,user["id"],category,data.get("title") or "Incident",data.get("description"),data.get("root_cause_suggested"),accepted,status,ts,ts))
+                add_audit(con,oid,user["id"],"incident_created","incident",f"Utworzono incydent: {data.get('title') or 'Incident'}",{"incident_id":cur.lastrowid,"category":data.get("category")})
+                return self.send_json({"id":cur.lastrowid},201)
+
+            m = re.fullmatch(r"/api/orders/(\d+)/audit-notes", path)
+            if m:
+                user=self.require_user(con)
+                if not user:return
+                oid=int(m.group(1))
+                if not can_access_order(con,user,oid,True): return self.send_error_json("Brak dostępu",403)
+                summary=(data.get("summary") or "").strip()
+                if not summary:return self.send_error_json("Brak treści")
+                add_audit(con,oid,user["id"],"manual_note","manual",summary,{"note":summary},data.get("verification") or "unverified")
+                return self.send_json({"ok":True},201)
+
+            m = re.fullmatch(r"/api/audit/(\d+)/comments", path)
+            if m:
+                user=self.require_user(con)
+                if not user:return
+                aid=int(m.group(1)); a=con.execute("SELECT * FROM audit WHERE id=?",(aid,)).fetchone()
+                if not a or not can_access_order(con,user,a["order_id"],True):return self.send_error_json("Brak dostępu",403)
