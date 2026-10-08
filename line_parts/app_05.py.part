@@ -1,0 +1,135 @@
+                comment=(data.get("comment") or "").strip()
+                if not comment:return self.send_error_json("Pusty komentarz")
+                con.execute("INSERT INTO audit_comments(audit_id,user_id,comment,created_at) VALUES(?,?,?,?)",(aid,user["id"],comment,now_iso()))
+                return self.send_json({"ok":True},201)
+
+        return self.send_error_json("Nie znaleziono",404)
+
+    def do_PATCH(self):
+        cleanup_expired_docs()
+        path=urlparse(self.path).path
+        try:data=self.json_body()
+        except Exception as e:return self.send_error_json(f"Nieprawidłowe dane: {e}")
+        with db() as con:
+            user=self.require_user(con)
+            if not user:return
+            m=re.fullmatch(r"/api/orders/(\d+)",path)
+            if m:
+                oid=int(m.group(1))
+                if not can_access_order(con,user,oid,True):return self.send_error_json("Brak dostępu",403)
+                old=con.execute("SELECT * FROM orders WHERE id=?",(oid,)).fetchone()
+                if "ball_holder_role" in data and data["ball_holder_role"] not in ROLES:
+                    return self.send_error_json("Nieprawidłowa wartość pola: piłka po stronie")
+                if "quality_rating" in data and data["quality_rating"] not in (None, "", "clean transport", "minor issue", "major incident", "claim"):
+                    return self.send_error_json("Nieprawidłowa ocena jakości")
+                changes=[]; vals=[]; audit_changes={}
+                for f in ORDER_FIELDS:
+                    if f in data:
+                        nv=data[f]
+                        if f=="closed_by_pod":nv=1 if nv else 0
+                        ov=old[f]
+                        if str(ov or "") != str(nv or ""):
+                            changes.append(f"{f}=?"); vals.append(nv); audit_changes[f]={"old":ov,"new":nv}
+                if "owner_forwarder_id" in data or "dispatcher_id" in data:
+                    if user["role"]!=ROLE_SUPERVISOR:return self.send_error_json("Tylko supervisor może zmieniać przypisanie",403)
+                    if "owner_forwarder_id" in data and data["owner_forwarder_id"] and not valid_user_for_role(con, data["owner_forwarder_id"], ROLE_FORWARDER):
+                        return self.send_error_json("Przypisany spedytor nie istnieje albo ma złą rolę")
+                    if "dispatcher_id" in data and data["dispatcher_id"] and not valid_user_for_role(con, data["dispatcher_id"], ROLE_DISPATCHER):
+                        return self.send_error_json("Przypisany dyspozytor nie istnieje albo ma złą rolę")
+                    for f in ("owner_forwarder_id","dispatcher_id"):
+                        if f in data and old[f]!=data[f]:
+                            changes.append(f"{f}=?");vals.append(data[f]);audit_changes[f]={"old":old[f],"new":data[f],"old_name":user_name(con,old[f]),"new_name":user_name(con,data[f])}
+                if not changes:return self.send_json({"ok":True,"changed":0})
+                changes.append("updated_at=?");vals.append(now_iso());vals.append(oid)
+                try:con.execute(f"UPDATE orders SET {','.join(changes)} WHERE id=?",vals)
+                except sqlite3.IntegrityError:return self.send_error_json("Numer zlecenia już istnieje",409)
+                for f,diff in audit_changes.items():
+                    ev="assignment_change" if f in ("owner_forwarder_id","dispatcher_id") else "order_field_change"
+                    label=TRACKED_LABELS.get(f,f)
+                    add_audit(con,oid,user["id"],ev,"status",f"Zmiana: {label}",{"field":f,**diff})
+                return self.send_json({"ok":True,"changed":len(audit_changes)})
+
+            m=re.fullmatch(r"/api/tasks/(\d+)",path)
+            if m:
+                tid=int(m.group(1));task=con.execute("SELECT * FROM tasks WHERE id=?",(tid,)).fetchone()
+                if not task or not can_access_order(con,user,task["order_id"],True):return self.send_error_json("Brak dostępu",403)
+                updates=[];vals=[];audit_summary=None;details={"task_id":tid}
+                action=data.get("action")
+                if action=="ack":
+                    if not task["ack_at"]:
+                        updates += ["ack_at=?","updated_at=?"]; vals += [now_iso(),now_iso()]; audit_summary=f"ACK zadania: {task['title']}"
+                elif action=="resolve":
+                    ts=now_iso();updates += ["status='resolved'","resolved_at=?","updated_at=?"];vals += [ts,ts];audit_summary=f"Rozwiązano zadanie: {task['title']}"
+                elif action=="reopen":
+                    updates += ["status='open'","resolved_at=NULL","updated_at=?"];vals += [now_iso()];audit_summary=f"Ponownie otwarto zadanie: {task['title']}"
+                if "deadline" in data:
+                    reason=(data.get("reason") or "").strip()
+                    if not reason:return self.send_error_json("Zmiana deadline wymaga powodu")
+                    updates += ["deadline=?","deadline_changed_count=deadline_changed_count+1","last_deadline_reason=?","updated_at=?"]
+                    vals += [data["deadline"],reason,now_iso()]
+                    audit_summary=f"Zmieniono deadline zadania: {task['title']}";details.update({"old_deadline":task["deadline"],"new_deadline":data["deadline"],"reason":reason})
+                if not updates:return self.send_json({"ok":True,"changed":0})
+                vals.append(tid);con.execute(f"UPDATE tasks SET {','.join(updates)} WHERE id=?",vals)
+                add_audit(con,task["order_id"],user["id"],"task_update","task",audit_summary or "Aktualizacja zadania",details)
+                return self.send_json({"ok":True})
+
+            m=re.fullmatch(r"/api/milestones/(\d+)",path)
+            if m:
+                mid=int(m.group(1));ms=con.execute("SELECT * FROM milestones WHERE id=?",(mid,)).fetchone()
+                if not ms or not can_access_order(con,user,ms["order_id"],True):return self.send_error_json("Brak dostępu",403)
+                allowed=["name","seq","status","deadline","owner_user_id","comment","checklist"]
+                if "owner_user_id" in data and data["owner_user_id"] and not valid_active_user(con, data["owner_user_id"]):
+                    return self.send_error_json("Owner milestone nie istnieje lub jest nieaktywny")
+                updates=[];vals=[];changes={}
+                for f in allowed:
+                    if f in data:
+                        nv=json.dumps(data[f],ensure_ascii=False) if f=="checklist" and not isinstance(data[f],str) else data[f]
+                        if str(ms[f] or "")!=str(nv or ""):
+                            updates.append(f"{f}=?");vals.append(nv);changes[f]={"old":ms[f],"new":nv}
+                if data.get("status")=="done" and ms["status"]!="done":updates.append("completed_at=?");vals.append(now_iso())
+                if not updates:return self.send_json({"ok":True,"changed":0})
+                vals.append(mid);con.execute(f"UPDATE milestones SET {','.join(updates)} WHERE id=?",vals)
+                add_audit(con,ms["order_id"],user["id"],"milestone_update","status",f"Aktualizacja milestone: {ms['name']}",{"milestone_id":mid,"changes":changes})
+                return self.send_json({"ok":True})
+
+            m=re.fullmatch(r"/api/incidents/(\d+)",path)
+            if m:
+                iid=int(m.group(1));inc=con.execute("SELECT * FROM incidents WHERE id=?",(iid,)).fetchone()
+                if not inc or not can_access_order(con,user,inc["order_id"],True):return self.send_error_json("Brak dostępu",403)
+                allowed=["category","title","description","root_cause_suggested","root_cause_accepted","status"]
+                if "category" in data and data["category"] not in {"carrier","dispatch","forwarder","client","customs","external"}:
+                    return self.send_error_json("Nieprawidłowa kategoria incydentu")
+                if "status" in data and data["status"] not in {"open","investigating","closed"}:
+                    return self.send_error_json("Nieprawidłowy status incydentu")
+                if "root_cause_accepted" in data and user["role"] not in (ROLE_FORWARDER, ROLE_SUPERVISOR):
+                    return self.send_error_json("Root cause może zaakceptować spedytor lub supervisor",403)
+                updates=[];vals=[];changes={}
+                for f in allowed:
+                    if f in data and str(inc[f] or "")!=str(data[f] or ""):
+                        updates.append(f"{f}=?");vals.append(data[f]);changes[f]={"old":inc[f],"new":data[f]}
+                if not updates:return self.send_json({"ok":True,"changed":0})
+                updates.append("updated_at=?");vals.append(now_iso());vals.append(iid)
+                con.execute(f"UPDATE incidents SET {','.join(updates)} WHERE id=?",vals)
+                add_audit(con,inc["order_id"],user["id"],"incident_update","incident",f"Aktualizacja incydentu: {inc['title']}",{"incident_id":iid,"changes":changes})
+                return self.send_json({"ok":True})
+        return self.send_error_json("Nie znaleziono",404)
+
+
+def main():
+    parser=argparse.ArgumentParser(description="Transport Communications MVP - lokalny serwer LAN / public demo")
+    parser.add_argument("--host",default="0.0.0.0")
+    parser.add_argument("--port",type=int,default=int(os.getenv("PORT", "8080")))
+    args=parser.parse_args()
+    if PUBLIC_MODE and not APP_ACCESS_KEY:
+        raise SystemExit("PUBLIC_MODE=1 wymaga ustawienia APP_ACCESS_KEY")
+    init_db()
+    httpd=ThreadingHTTPServer((args.host,args.port),Handler)
+    print(f"Transport Communications MVP: http://127.0.0.1:{args.port}")
+    print(f"LAN: uruchom ipconfig/ifconfig i otwórz http://<IP_TEGO_KOMPUTERA>:{args.port}")
+    print("CTRL+C aby zatrzymać")
+    try:httpd.serve_forever()
+    except KeyboardInterrupt:pass
+    finally:httpd.server_close()
+
+if __name__=="__main__":
+    main()
