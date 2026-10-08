@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import hashlib
+import hmac
+import json
+import mimetypes
+import os
+import re
+import secrets
+import sqlite3
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+from http import cookies
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+ROOT = Path(__file__).resolve().parent
+STATIC = ROOT / "static"
+DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT))).expanduser().resolve()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+UPLOADS = DATA_DIR / "uploads"
+DB_PATH = Path(os.getenv("DB_PATH", str(DATA_DIR / "transport_comms.db"))).expanduser().resolve()
+UPLOADS.mkdir(parents=True, exist_ok=True)
+PUBLIC_MODE = os.getenv("PUBLIC_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+APP_ACCESS_KEY = os.getenv("APP_ACCESS_KEY", "")
+SESSIONS = {}
+ACCESS_SESSIONS = {}
+SESSIONS_LOCK = threading.Lock()
+CLEANUP_LOCK = threading.Lock()
+LAST_CLEANUP = 0.0
+
+ROLE_FORWARDER = "spedytor"
+ROLE_DISPATCHER = "dyspozytor"
+ROLE_SUPERVISOR = "supervisor"
+ROLES = {ROLE_FORWARDER, ROLE_DISPATCHER, ROLE_SUPERVISOR}
+
+TASK_TEMPLATES = {
+    "ack_urgent": ("ACK pilne", 20),
+    "ack_standard": ("ACK zwykłe", 30),
+    "ack_next_day": ("ACK next day", 60),
+    "info_requested": ("Informacja wymagana", 30),
+    "vehicle_data": ("Dane pojazdu / blachy", 30),
+    "driver_data": ("Dane kierowcy", 30),
+    "gps": ("GPS / tracking", 30),
+    "eta": ("ETA / pozycja", 20),
+    "cmr": ("CMR / dokument po załadunku", 30),
+    "pod": ("POD", 60),
+    "customs": ("Dokumenty / status celny", 20),
+    "change_verification": ("Weryfikacja zmiany", 20),
+    "carrier_response": ("Odpowiedź przewoźnika", 30),
+    "incident_followup": ("Wyjaśnienie incydentu", 20),
+    "other": ("INNE", 30),
+}
+
+SUGGESTED_MILESTONES = [
+    "Booking / organizacja auta",
+    "Vehicle confirmed",
+    "Driver / plates confirmed",
+    "GPS confirmed",
+    "Customs pre-clearance",
+    "Documents / CMR received",
+    "Border checkpoint",
+    "Ferry / train checkpoint",
+    "Customs checkpoint",
+    "Transit checkpoint",
+    "ETA checkpoint",
+]
+
+ORDER_FIELDS = [
+    "order_no", "title", "load_code", "unload_code", "vehicle_type", "cargo",
+    "load_deadline", "unload_deadline", "client", "carrier", "carrier_phone",
+    "carrier_other_contact", "driver_name", "driver_phone", "tractor_plate",
+    "trailer_plate", "gps_link", "gps_type", "gps_received_at", "gps_expires_at",
+    "cargo_value", "insurance_info", "requirements", "ball_holder_role",
+    "closed_by_pod", "quality_rating", "current_stage"
+]
+
+TRACKED_LABELS = {
+    "order_no": "numer zlecenia", "load_code": "kod załadunku", "unload_code": "kod rozładunku",
+    "vehicle_type": "typ auta", "cargo": "towar", "load_deadline": "termin załadunku",
+    "unload_deadline": "termin rozładunku", "carrier": "przewoźnik", "carrier_phone": "telefon przewoźnika",
+    "driver_name": "kierowca", "driver_phone": "telefon kierowcy", "tractor_plate": "blachy ciągnika",
+    "trailer_plate": "blachy naczepy", "gps_link": "GPS", "gps_type": "typ GPS",
+    "gps_expires_at": "ważność GPS", "cargo_value": "wartość towaru", "insurance_info": "ubezpieczenie",
+    "requirements": "wymagania", "ball_holder_role": "piłka po stronie", "current_stage": "etap",
+    "closed_by_pod": "zamknięcie POD", "quality_rating": "ocena jakości"
+}
+
+SCHEMA = r"""
+PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    username TEXT NOT NULL UNIQUE,
+    role TEXT NOT NULL CHECK(role IN ('spedytor','dyspozytor','supervisor')),
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_no TEXT UNIQUE,
+    title TEXT,
+    load_code TEXT,
+    unload_code TEXT,
+    vehicle_type TEXT,
+    cargo TEXT,
+    load_deadline TEXT,
+    unload_deadline TEXT,
+    client TEXT,
+    carrier TEXT,
+    carrier_phone TEXT,
+    carrier_other_contact TEXT,
+    driver_name TEXT,
+    driver_phone TEXT,
+    tractor_plate TEXT,
+    trailer_plate TEXT,
+    gps_link TEXT,
+    gps_type TEXT,
+    gps_received_at TEXT,
+    gps_expires_at TEXT,
+    cargo_value TEXT,
+    insurance_info TEXT,
+    requirements TEXT,
+    owner_forwarder_id INTEGER,
+    dispatcher_id INTEGER,
+    ball_holder_role TEXT DEFAULT 'dyspozytor',
+    current_stage TEXT DEFAULT 'Załadunek',
+    closed_by_pod INTEGER NOT NULL DEFAULT 0,
+    quality_rating TEXT,
+    created_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(owner_forwarder_id) REFERENCES users(id),
+    FOREIGN KEY(dispatcher_id) REFERENCES users(id),
+    FOREIGN KEY(created_by) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    reply_to_id INTEGER,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE,
+    FOREIGN KEY(user_id) REFERENCES users(id),
+    FOREIGN KEY(reply_to_id) REFERENCES messages(id)
+);
+CREATE TABLE IF NOT EXISTS message_reactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    reaction TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(message_id,user_id,reaction),
+    FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    created_by INTEGER NOT NULL,
+    assigned_to INTEGER,
+    title TEXT NOT NULL,
+    template_key TEXT NOT NULL DEFAULT 'other',
+    deadline TEXT,
+    no_deadline INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'open',
+    source_message_id INTEGER,
+    ack_at TEXT,
+    resolved_at TEXT,
+    deadline_changed_count INTEGER NOT NULL DEFAULT 0,
+    last_deadline_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE,
+    FOREIGN KEY(created_by) REFERENCES users(id),
+    FOREIGN KEY(assigned_to) REFERENCES users(id),
+    FOREIGN KEY(source_message_id) REFERENCES messages(id)
+);
+CREATE TABLE IF NOT EXISTS milestones (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    seq REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    deadline TEXT,
+    owner_user_id INTEGER,
+    comment TEXT,
+    checklist TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE,
+    FOREIGN KEY(owner_user_id) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    user_id INTEGER,
+    event_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    details TEXT,
+    verification TEXT DEFAULT 'system',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS audit_comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    audit_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    comment TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(audit_id) REFERENCES audit(id) ON DELETE CASCADE,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    filename TEXT NOT NULL,
+    stored_name TEXT NOT NULL,
+    mime TEXT,
+    size INTEGER NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS incidents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    created_by INTEGER NOT NULL,
+    category TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    root_cause_suggested TEXT,
+    root_cause_accepted TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE,
+    FOREIGN KEY(created_by) REFERENCES users(id)
+);
+"""
+
+
+def now_dt():
+    return datetime.now().astimezone()
+
+
+def now_iso():
+    return now_dt().isoformat(timespec="seconds")
+
+
+def parse_iso(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=now_dt().tzinfo)
+        return dt
+    except Exception:
+        return None
+
+
+def db():
+    con = sqlite3.connect(DB_PATH, timeout=15)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA busy_timeout=15000")
+    con.execute("PRAGMA journal_mode=WAL")
+    return con
+
+
+def init_db():
